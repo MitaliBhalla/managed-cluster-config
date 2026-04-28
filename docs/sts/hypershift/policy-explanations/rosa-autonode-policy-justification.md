@@ -4,6 +4,10 @@
 
 This document provides detailed justification for each permission in the ROSA Karpenter Controller managed policy. ROSA Karpenter Controller is an automatic node provisioning and scaling feature for Red Hat OpenShift Service on AWS (ROSA) clusters, similar to Karpenter functionality but integrated with ROSA's security model and operational patterns.
 
+### AWS managed policy compliance
+
+The JSON policy omits permissions that fail AWS **customer-managed** / AppSec checks for this policy class: for example **`pricing:GetProducts`** with an unscoped `Resource`, and restricted IAM instance-profile **mutations** (**`iam:CreateInstanceProfile`**, **`TagInstanceProfile`**, **`AddRoleToInstanceProfile`**, **`RemoveRoleFromInstanceProfile`**, **`DeleteInstanceProfile`**). Instance profile **creation and association** are owned by **ROSA HCP install / OCM**; the controller policy keeps **`iam:GetInstanceProfile`** and **`iam:ListInstanceProfiles`** only.
+
 ## Security Model
 
 The ROSA Karpenter Controller policy follows the established ROSA security patterns:
@@ -13,7 +17,7 @@ The ROSA Karpenter Controller policy follows the established ROSA security patte
 - **Resource modification**: Requires existing resource tags for managed resources
 - **Combined operations**: Uses both request and resource tag conditions where appropriate
 
-**Note (request tags on IAM create)**: `aws:RequestTag/red-hat-managed` is evaluated only when the **IAM API request** includes that tag (it is not the same as resource tags already stored on an object). For managed ROSA/HyperShift clusters, tags from `HostedControlPlane.spec.platform.aws` (including `red-hat-managed`) are merged into the guest `EC2NodeClass` and are intended to be passed when the upstream Karpenter AWS provider creates or tags instance profiles. This matches `sts_hcp_installer_permission_policy.json` for `CreateInstanceProfile` / `TagInstanceProfile`. **Validation**: confirm via CloudTrail (`CreateInstanceProfile` / `TagInstanceProfile` `requestParameters`) that tags are present on the request where this condition applies.
+**Note (instance profiles)**: Worker instance profile **create** / **tag** / **role attach** for this flow is performed by **HCP install / OCM** (not by the Karpenter controller role in this policy). **Validation**: CloudTrail for `CreateInstanceProfile` and related IAM calls is expected under the **installer/OCM** role; the controller uses **`CreateLaunchTemplate`** / **`RunInstances`** with the existing profile name. EC2 / launch-template calls continue to use **`red-hat-managed`** request tags where those statements apply.
 
 ## Permission Groups and Justifications
 
@@ -22,19 +26,15 @@ The ROSA Karpenter Controller policy follows the established ROSA security patte
 **Actions**: `ec2:Describe*`
 **Resource**: `*`
 **Justification**: Karpenter Controller requires comprehensive read access to understand the AWS environment for node placement decisions. These read-only operations are essential for:
-- Discovering available instance types and pricing
+- Discovering available instance types and spot/history signals (see pricing API note below)
 - Understanding network topology (VPCs, subnets, security groups)
 - Making informed scaling decisions based on resource availability
 
 **Security**: Read operations pose minimal security risk and do not modify infrastructure.
 
-### PricingReadActions
+### No standalone Pricing API (managed policy compliance)
 
-**Actions**: `pricing:GetProducts`
-**Resource**: `*`
-**Justification**: Enables cost-aware node provisioning by accessing AWS pricing information. Karpenter Controller can make optimal instance selection decisions based on cost considerations and spot instance pricing.
-
-**Security**: Pricing service is global and read-only, posing no security risk.
+`pricing:GetProducts` is **not** included: AWS managed policy validation for this class of policy disallows that action with an unscoped `Resource`. **Cost and capacity signals** use the existing **EC2** `Describe*` permissions (including **`ec2:DescribeInstanceTypes`**, **`ec2:DescribeSpotPriceHistory`**, **`ec2:DescribeInstanceTypeOfferings`**, etc.) in **ReadPermissions**, which are permitted with `Resource: *` for those APIs.
 
 ### KMSPermissions
 
@@ -127,22 +127,13 @@ The ROSA Karpenter Controller policy follows the established ROSA security patte
 
 **Security**: PassRole is limited to EC2 service only, preventing privilege escalation to other services.
 
-### ManageInstanceProfiles
+### ReadInstanceProfiles
 
-**Actions**: `iam:AddRoleToInstanceProfile`, `iam:RemoveRoleFromInstanceProfile`, `iam:DeleteInstanceProfile`, `iam:GetInstanceProfile`
+**Actions**: `iam:GetInstanceProfile`
 **Resource**: `arn:aws:iam::*:instance-profile/rosa-service-managed-*`, `arn:aws:iam::*:instance-profile/*-worker`
-**Justification**: Karpenter Controller needs to attach, detach, and remove roles on existing instance profiles and read profile metadata for node provisioning. These operations are scoped by **resource ARN** (no request-tag condition): the profile must already exist and match the allowed name patterns. `rosa-service-managed-*` matches the HCP installer instance profile pattern; `*-worker` covers HyperShift worker-style profile names used in this flow.
+**Justification**: Read **only** (no **`AddRoleToInstanceProfile`**, **`RemoveRoleFromInstanceProfile`**, **`DeleteInstanceProfile`**, **`CreateInstanceProfile`**, **`TagInstanceProfile`** in this policy). Those **mutations** are blocked by managed-policy / AppSec validation for this policy class; profile **lifecycle** is owned by HCP **install/OCM**. The controller only needs to **resolve** metadata for instance profiles that already match the expected patterns.
 
-**Security**: Service boundary enforced through resource ARN restriction. Only instance profiles matching these naming patterns can be read or modified.
-
-### CreateInstanceProfiles
-
-**Actions**: `iam:CreateInstanceProfile`, `iam:TagInstanceProfile`
-**Resource**: `arn:aws:iam::*:instance-profile/rosa-service-managed-*`, `arn:aws:iam::*:instance-profile/*-worker`
-**Condition**: `aws:RequestTag/red-hat-managed: "true"`
-**Justification**: Same pattern as `sts_hcp_installer_permission_policy.json`: new instance profiles must be created/tagged with the ROSA management tag on the **request**. Platform tags from `HostedControlPlane.spec.platform.aws.resourceTags` (including `red-hat-managed`) flow into the guest `EC2NodeClass` and into the provider’s IAM calls when supported. **Operational validation**: use CloudTrail to confirm `requestParameters` include the expected tags on `CreateInstanceProfile` / `TagInstanceProfile` for the controller role.
-
-**Security**: Service boundary enforced through resource ARN restriction plus required `red-hat-managed` request tag on create/tag calls (aligned with HCP installer policy).
+**Security**: ARN-limited read for known profile name patterns. Mutating IAM is out of scope for this JSON by design.
 
 ### ListInstanceProfiles
 
@@ -181,4 +172,4 @@ ROSA Karpenter Controller operates as a cluster component with the following wor
 6. Handles scaling down and resource cleanup when demand decreases
 7. Responds to interruption events for graceful node replacement
 
-EC2 lifecycle and tagging use `red-hat-managed` (request and/or resource conditions) as the primary service boundary where those statements apply; IAM instance profile **create/tag** uses **ARN patterns** plus **`aws:RequestTag/red-hat-managed`**, consistent with the HCP installer managed policy.
+EC2 lifecycle and tagging use `red-hat-managed` (request and/or resource conditions) as the primary service boundary where those statements apply. IAM instance profile **mutations** are not in this policy (see **ReadInstanceProfiles** and **AWS managed policy compliance** above); install/OCM policies cover create/tag/attach as required.
